@@ -1,32 +1,25 @@
-mod max_value;
+mod index_type;
 
-use crate::max_value::MaxValue;
+use crate::index_type::*;
 
-use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 
-/// A trait for the type that is used as an index into the list.
-/// The type needs to be convertible to `usize` and should generally
-/// be as small as possible; the list can store up to the maximum
-/// value available by the type _minus one_.
-///
-/// ## Example
-/// If the list only contains up to 254 elements, the type `u8` should be used
-/// since `u8::MAX - 1 == 254`.
-pub trait IndexType:
-    Sized + Copy + Eq + PartialOrd + Ord + Debug + MaxValue + Into<usize> + From<usize>
-{
-}
-
-/// Automatic implementation of the `IndexType` trait.
-impl<T> IndexType for T where
-    T: Sized + Copy + Eq + PartialOrd + Ord + Debug + MaxValue + Into<usize> + From<usize>
-{
-}
-
 /// Provides an indexed free list with constant-time removals from anywhere
-/// in the list without invalidating indices. T must be trivially constructible
-/// and destructible.
+/// in the list without invalidating indices.
+///
+/// ## Safety
+/// - The maximum number of elements that can be added to this list is `TIndex::MAX - 1`,
+///   e.g. `254` when `TIndex` is substituted with a `u8`.
+/// - While the implementation of this type makes heavy use of debug-time assertions, the
+///   user must make sure to never add more items to the list than the index type
+///   can maintain.
+/// - At most `usize::MAX` elements can be stored in this vector.
+///
+/// ## Type parameters
+/// * `T` - The type of the element. Must be trivially constructible and destructible.
+/// * `TIndex` - The type of the index; see safety considerations above. "Smaller" types (e.g. `u8`)
+///   result in a more memory-efficient representation, while "larger" types (e.g. `usize`) allow
+///   for more data to be stored.
 pub struct FreeList<T, TIndex = usize>
 where
     T: Default,
@@ -58,6 +51,15 @@ where
     T: Default,
     TIndex: IndexType,
 {
+    /// Creates an empty list.
+    ///
+    /// ## Example
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let list = FreeList::<&str, u8>::default();
+    /// assert_eq!(list.capacity(), 0);
+    /// ```
     fn default() -> Self {
         Self {
             data: Vec::default(),
@@ -77,15 +79,38 @@ where
     pub(crate) const SENTINEL: TIndex = TIndex::MAX;
 
     /// Inserts an element to the free list and returns an index to it.
+    ///
+    /// ## Example
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let mut list = FreeList::<&str, u8>::default();
+    /// assert_eq!(list.push("test"), 0);
+    /// assert_eq!(list.capacity(), 1);
+    /// ```
     pub fn push(&mut self, element: T) -> TIndex {
         #[cfg(debug_assertions)]
         {
+            if self.length >= usize::MAX {
+                panic!(
+                    "Attempted to insert more elements than can be addressed by the underlying index type ({:?} allowed)",
+                    usize::MAX
+                );
+            }
+
+            if self.length >= unsafe { Self::SENTINEL.into() } - 1 {
+                panic!(
+                    "Attempted to insert more elements than can be addressed by the provided index type ({:?} allowed)",
+                    TIndex::MAX
+                );
+            }
+
             self.length += 1;
         }
 
         return if self.first_free != Self::SENTINEL {
             let index = self.first_free;
-            let index_usize = index.into();
+            let index_usize = unsafe { index.into() };
 
             // Set the "first free" pointer to the next free index.
             self.first_free = unsafe { self.data[index_usize].next };
@@ -98,13 +123,30 @@ where
                 element: ManuallyDrop::new(element),
             };
             self.data.push(fe);
-            <TIndex as From<usize>>::from(self.data.len() - 1)
+            unsafe { <TIndex as FromAndIntoUsize>::from(self.data.len() - 1) }
         };
     }
 
     /// Removes the nth element from the free list.
+    ///
+    /// ## Example
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let mut list = FreeList::<&str, u8>::default();
+    /// list.push("uses one slot");
+    ///
+    /// // After erasing the just-inserted element, the capacity stays at
+    /// // 1 because the list is not compacted.
+    /// list.erase(0);
+    /// assert_eq!(list.capacity(), 1);
+    ///
+    /// // After inserting again, the capacity is still 1 because
+    /// // the slot was reused.
+    /// list.push("uses the same slot");
+    /// assert_eq!(list.capacity(), 1);
+    /// ```
     pub fn erase(&mut self, n: TIndex) {
-        self.first_free = Self::SENTINEL;
         if self.data.is_empty() {
             return;
         }
@@ -113,7 +155,7 @@ where
         #[cfg(debug_assertions)]
         debug_assert!(self.length > 0);
 
-        let n_usize = n.into();
+        let n_usize = unsafe { n.into() };
         unsafe { ManuallyDrop::drop(&mut self.data[n_usize].element) };
         self.data[n_usize].next = self.first_free;
         self.first_free = n;
@@ -125,6 +167,17 @@ where
     }
 
     /// Removes all elements from the free list.
+    /// ## Example
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let mut list = FreeList::<&str, u8>::default();
+    /// list.push("one");
+    /// list.push("two");
+    ///
+    /// list.clear();
+    /// assert_eq!(list.capacity(), 0);
+    /// ```
     pub fn clear(&mut self) {
         if self.data.is_empty() {
             assert_eq!(self.first_free, Self::SENTINEL);
@@ -146,7 +199,8 @@ where
         if !free_indexes.is_empty() {
             for (i, entry) in self.data.iter_mut().enumerate() {
                 if free_indexes.is_empty()
-                    || *free_indexes.last().unwrap() != <TIndex as From<usize>>::from(i)
+                    || *free_indexes.last().unwrap()
+                        != unsafe { <TIndex as FromAndIntoUsize>::from(i) }
                 {
                     // This is not a pointer entry, drop required.
                     unsafe { ManuallyDrop::drop(&mut entry.element) };
@@ -175,6 +229,32 @@ where
     /// If the element at the specified index was erased, the union now acts
     ///  as a pointer to the next free element. Accessing the same index again after that.
     ///  is undefined behavior.
+    ///
+    /// ## Example
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let mut list = FreeList::<&str, u8>::default();
+    /// assert_eq!(list.push("first"), 0);
+    /// assert_eq!(list.push("second"), 1);
+    ///
+    /// let element = unsafe { list.at(0) };
+    /// assert_eq!(*element, "first");
+    /// ```
+    ///
+    /// Note that accessing a previously erased item is undefined behavior:
+    ///
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let mut list = FreeList::<&str, u8>::default();
+    /// list.push("first");
+    ///
+    /// // SAFETY: The code below is undefined behavior:
+    /// list.erase(0);
+    /// // let element = unsafe { list.at(0) };
+    /// // assert_eq!(*element, "first");
+    /// ```
     #[inline]
     pub unsafe fn at(&self, index: TIndex) -> &T {
         debug_assert_ne!(index, Self::SENTINEL);
@@ -189,6 +269,23 @@ where
     /// If the element at the specified index was erased, the union now acts
     /// as a pointer to the next free element. Accessing the same index again after that.
     /// is undefined behavior.
+    ///
+    /// ## Example
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let mut list = FreeList::<&str, u8>::default();
+    /// assert_eq!(list.push("first"), 0);
+    /// assert_eq!(list.push("second"), 1);
+    ///
+    /// let element = unsafe { list.at_mut(1) };
+    /// *element = "danger";
+    ///
+    /// assert_eq!(unsafe { list.at(1) }, &"danger");
+    /// ```
+    ///
+    /// As with `at()`, accessing a previously erased element is
+    /// undefined behavior.
     #[inline]
     pub unsafe fn at_mut(&mut self, index: TIndex) -> &mut T {
         debug_assert_ne!(index, Self::SENTINEL);
@@ -197,6 +294,36 @@ where
     }
 
     /// Gets the current capacity of the list.
+    ///
+    /// ```rust
+    /// use free_list::FreeList;
+    ///
+    /// let mut list = FreeList::<&str, u8>::default();
+    ///
+    /// // The first elements increase the capacity.
+    /// list.push("first");
+    /// list.push("second");
+    /// assert_eq!(list.capacity(), 2);
+    ///
+    /// // Erasing elements does not decrease the capacity.
+    /// list.erase(0);
+    /// list.erase(1);
+    /// assert_eq!(list.capacity(), 2);
+    ///
+    /// // Adding elements after an erase does not increase capacity.
+    /// list.push("fourth");
+    /// list.push("fifth");
+    /// assert_eq!(list.capacity(), 2);
+    ///
+    /// // Adding more elements increases capacity.
+    /// list.push("sixth");
+    /// list.push("seventh");
+    /// assert_eq!(list.capacity(), 4);
+    ///
+    /// // Clearing the list frees all resources.
+    /// list.clear();
+    /// assert_eq!(list.capacity(), 0);
+    /// ```
     #[allow(dead_code)]
     pub fn capacity(&self) -> usize {
         self.data.len()
@@ -204,7 +331,8 @@ where
 
     /// Gets the number of elements in the list.
     #[allow(dead_code)]
-    pub fn debug_len(&self) -> usize {
+    #[cfg(debug_assertions)]
+    fn debug_len(&self) -> usize {
         #[cfg(debug_assertions)]
         return self.length;
         #[cfg(not(debug_assertions))]
@@ -212,6 +340,7 @@ where
     }
 
     #[allow(dead_code, unused_variables)]
+    #[cfg(debug_assertions)]
     fn debug_is_in_free_list(&self, n: TIndex) -> bool {
         #[cfg(any(debug_assertions, test))]
         {
@@ -376,6 +505,62 @@ mod test {
         // Get a new reference and verify.
         let element = unsafe { list.at(0) };
         assert_eq!(*element, Complex(0., 0.));
+    }
+
+    #[test]
+    fn size_of_static() {
+        // Complex as payload type.
+        assert_eq!(std::mem::size_of::<Complex>(), 16);
+        assert_eq!(
+            std::mem::size_of::<FreeElement<Complex, u8>>(),
+            std::mem::size_of::<Complex>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<Complex, u16>>(),
+            std::mem::size_of::<Complex>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<Complex, u32>>(),
+            std::mem::size_of::<Complex>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<Complex, u64>>(),
+            std::mem::size_of::<Complex>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<Complex, u128>>(),
+            std::mem::size_of::<Complex>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<Complex, usize>>(),
+            std::mem::size_of::<Complex>()
+        );
+
+        // u8 as payload type.
+        assert_eq!(
+            std::mem::size_of::<FreeElement<u8, u8>>(),
+            std::mem::size_of::<u8>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<u8, u16>>(),
+            std::mem::size_of::<u16>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<u8, u32>>(),
+            std::mem::size_of::<u32>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<u8, u64>>(),
+            std::mem::size_of::<u64>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<u8, u128>>(),
+            std::mem::size_of::<u128>()
+        );
+        assert_eq!(
+            std::mem::size_of::<FreeElement<u8, usize>>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     fn insert_some(list: &mut FreeList<Complex>, n: usize) {

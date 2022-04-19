@@ -2,5 +2,7 @@
 name = "free-list"
 version = "0.1.0"
 description = "An indexed free list with constant-time removals from anywhere."
+license = "MIT"
 authors = ["Markus Mayer"]
+repository = "https://github.com/sunsided/free-list-rs"
 edition = "2021"
