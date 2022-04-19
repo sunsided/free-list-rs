@@ -2,7 +2,6 @@ mod max_value;
 
 use crate::max_value::MaxValue;
 
-use num_traits::PrimInt;
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 
@@ -14,10 +13,16 @@ use std::mem::ManuallyDrop;
 /// ## Example
 /// If the list only contains up to 254 elements, the type `u8` should be used
 /// since `u8::MAX - 1 == 254`.
-pub trait IndexType: PrimInt + Debug + MaxValue + Into<usize> + From<usize> {}
+pub trait IndexType:
+    Sized + Copy + Eq + PartialOrd + Ord + Debug + MaxValue + Into<usize> + From<usize>
+{
+}
 
 /// Automatic implementation of the `IndexType` trait.
-impl<T> IndexType for T where T: PrimInt + Debug + MaxValue + Into<usize> + From<usize> {}
+impl<T> IndexType for T where
+    T: Sized + Copy + Eq + PartialOrd + Ord + Debug + MaxValue + Into<usize> + From<usize>
+{
+}
 
 /// Provides an indexed free list with constant-time removals from anywhere
 /// in the list without invalidating indices. T must be trivially constructible
