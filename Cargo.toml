@@ -1,0 +1,8 @@
+[package]
+name = "free-list"
+version = "0.1.0"
+description = "An indexed free list with constant-time removals from anywhere."
+authors = ["Markus Mayer"]
+edition = "2021"
+
+[dependencies]
